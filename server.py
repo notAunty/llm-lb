@@ -1,463 +1,628 @@
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 import logging
 import json
+import yaml
 import os
-import time
-import itertools
-import threading
-from typing import Dict, List, Optional, Any
-from urllib.parse import urlparse
-from dotenv import load_dotenv
+import asyncio
 import httpx
+import time
+from typing import Dict, Any, List, Optional, Union
+from pydantic import BaseModel
+import uuid
+from datetime import datetime
+import sys
 
-# Import the existing functionality from production code
+# Import the existing proxy functionality
 from openai_anthropic import (
-    MessagesRequest, 
-    TokenCountRequest,
-    MessagesResponse,
-    TokenCountResponse,
-    convert_anthropic_to_litellm,
-    convert_litellm_to_anthropic,
-    handle_streaming,
-    log_request_beautifully,
-    app as original_app,
-    logger
+    MessagesRequest, MessagesResponse, TokenCountRequest, TokenCountResponse,
+    Message, Tool, Usage, ContentBlockText, ContentBlockToolUse,
+    log_request_beautifully, Colors
 )
-import litellm
-from fastapi.responses import StreamingResponse
 
-# Load environment variables
-load_dotenv()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
+logger = logging.getLogger(__name__)
 
-# Load balancing configuration
+# Quiet uvicorn logs
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+app = FastAPI(title="Multi-Provider LLM Load Balancer")
+
+class ProviderConfig:
+    def __init__(self, name: str, api_key_env_var: str, base_url: str, models: Dict[str, str]):
+        self.name = name
+        self.api_key_env_var = api_key_env_var
+        self.base_url = base_url
+        self.models = models
+        self.api_key = os.environ.get(api_key_env_var)
+        self.last_request_time = 0
+        self.request_count = 0
+        
+    def get_mapped_model(self, common_name: str) -> Optional[str]:
+        """Get provider-specific model name for a common model name."""
+        return self.models.get(common_name)
+    
+    def has_model(self, common_name: str) -> bool:
+        """Check if provider supports a given model."""
+        return common_name in self.models
+
 class LoadBalancerConfig:
-    def __init__(self):
-        # Parse multiple OpenAI API keys (comma-separated)
-        openai_keys_str = os.environ.get("OPENAI_API_KEYS", os.environ.get("OPENAI_API_KEY", ""))
-        self.openai_keys = [key.strip() for key in openai_keys_str.split(",") if key.strip()]
+    def __init__(self, config_path: str = "config.yaml"):
+        self.config_path = config_path
+        self.mode = "priority-based"  # Default
+        self.models = {}  # Global model configs
+        self.providers = []
+        self.load_config()
         
-        # Parse multiple Anthropic API keys (comma-separated) 
-        anthropic_keys_str = os.environ.get("ANTHROPIC_API_KEYS", os.environ.get("ANTHROPIC_API_KEY", ""))
-        self.anthropic_keys = [key.strip() for key in anthropic_keys_str.split(",") if key.strip()]
-        
-        # Parse service endpoints (JSON format)
-        endpoints_str = os.environ.get("SERVICE_ENDPOINTS", '{}')
+    def load_config(self):
+        """Load configuration from YAML file."""
         try:
-            self.service_endpoints = json.loads(endpoints_str)
-        except json.JSONDecodeError:
-            self.service_endpoints = {}
-            
-        # Default endpoints if not specified
-        if not self.service_endpoints:
-            self.service_endpoints = {
-                "openai": ["https://api.openai.com/v1"],
-                "anthropic": ["https://api.anthropic.com/v1"]
-            }
-        
-        # Initialize round-robin iterators
-        self.openai_key_cycle = itertools.cycle(self.openai_keys) if self.openai_keys else None
-        self.anthropic_key_cycle = itertools.cycle(self.anthropic_keys) if self.anthropic_keys else None
-        
-        # Initialize endpoint cycles for each service
-        self.endpoint_cycles = {}
-        for service, endpoints in self.service_endpoints.items():
-            if endpoints:
-                self.endpoint_cycles[service] = itertools.cycle(endpoints)
-        
-        # Thread locks for round-robin safety
-        self.openai_lock = threading.Lock()
-        self.anthropic_lock = threading.Lock()
-        self.endpoint_locks = {service: threading.Lock() for service in self.service_endpoints.keys()}
-        
-        logger.info(f"🔄 Load Balancer Initialized:")
-        logger.info(f"   📊 OpenAI Keys: {len(self.openai_keys)} configured")
-        logger.info(f"   📊 Anthropic Keys: {len(self.anthropic_keys)} configured") 
-        logger.info(f"   🌐 Service Endpoints: {json.dumps(self.service_endpoints, indent=2)}")
-
-    def get_next_openai_key(self) -> Optional[str]:
-        """Get the next OpenAI API key using round-robin."""
-        if not self.openai_key_cycle:
-            return None
-        with self.openai_lock:
-            return next(self.openai_key_cycle)
-    
-    def get_next_anthropic_key(self) -> Optional[str]:
-        """Get the next Anthropic API key using round-robin."""
-        if not self.anthropic_key_cycle:
-            return None
-        with self.anthropic_lock:
-            return next(self.anthropic_key_cycle)
-    
-    def get_next_endpoint(self, service: str) -> Optional[str]:
-        """Get the next endpoint for a service using round-robin."""
-        if service not in self.endpoint_cycles:
-            return None
-        with self.endpoint_locks[service]:
-            return next(self.endpoint_cycles[service])
-
-# Global load balancer instance
-lb_config = LoadBalancerConfig()
-
-# Create new FastAPI app for load balancing
-app = FastAPI(title="LM Proxy Load Balancer", description="Load balancing proxy for OpenAI and Anthropic APIs")
-
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Log requests with load balancing info."""
-    method = request.method
-    path = request.url.path
-    
-    logger.debug(f"🔄 Load Balanced Request: {method} {path}")
-    
-    response = await call_next(request)
-    return response
-
-def enhance_litellm_request_with_load_balancing(litellm_request: Dict[str, Any], model: str) -> Dict[str, Any]:
-    """Enhance the LiteLLM request with load-balanced API keys and endpoints."""
-    
-    # Determine service type based on model
-    if model.startswith("openai/"):
-        service = "openai"
-        api_key = lb_config.get_next_openai_key()
-        base_url = lb_config.get_next_endpoint("openai")
-        
-        if api_key:
-            litellm_request["api_key"] = api_key
-            logger.debug(f"🔑 Using OpenAI key: ...{api_key[-8:] if len(api_key) > 8 else api_key}")
-        
-        if base_url:
-            # Ensure the base URL is properly formatted for LiteLLM
-            if not base_url.endswith('/'):
-                base_url += '/'
-            litellm_request["api_base"] = base_url
-            logger.debug(f"🌐 Using OpenAI endpoint: {base_url}")
-            
-    elif model.startswith("anthropic/") or not model.startswith(("openai/", "gemini/")):
-        service = "anthropic"
-        api_key = lb_config.get_next_anthropic_key()
-        base_url = lb_config.get_next_endpoint("anthropic")
-        
-        if api_key:
-            litellm_request["api_key"] = api_key
-            logger.debug(f"🔑 Using Anthropic key: ...{api_key[-8:] if len(api_key) > 8 else api_key}")
-            
-        if base_url:
-            if not base_url.endswith('/'):
-                base_url += '/'
-            litellm_request["api_base"] = base_url
-            logger.debug(f"🌐 Using Anthropic endpoint: {base_url}")
-    
-    return litellm_request
-
-@app.post("/v1/messages")
-async def create_message_load_balanced(
-    request: MessagesRequest,
-    raw_request: Request
-):
-    """Load-balanced version of the messages endpoint."""
-    try:
-        # Get request body for logging
-        body = await raw_request.body()
-        body_json = json.loads(body.decode('utf-8'))
-        original_model = body_json.get("model", "unknown")
-        
-        # Get display name for logging
-        display_model = original_model
-        if "/" in display_model:
-            display_model = display_model.split("/")[-1]
-        
-        logger.debug(f"🔄 LOAD BALANCED REQUEST: Model={request.model}, Stream={request.stream}")
-        
-        # Convert Anthropic request to LiteLLM format (using existing function)
-        litellm_request = convert_anthropic_to_litellm(request)
-        
-        # Apply load balancing
-        litellm_request = enhance_litellm_request_with_load_balancing(litellm_request, request.model)
-        
-        # Enhanced request processing for OpenAI models (from existing code)
-        if "openai" in litellm_request["model"] and "messages" in litellm_request:
-            logger.debug(f"🔧 Processing OpenAI model request: {litellm_request['model']}")
-            
-            for i, msg in enumerate(litellm_request["messages"]):
-                if "content" in msg and isinstance(msg["content"], list):
-                    is_only_tool_result = True
-                    for block in msg["content"]:
-                        if not isinstance(block, dict) or block.get("type") != "tool_result":
-                            is_only_tool_result = False
-                            break
+            if os.path.exists(self.config_path):
+                with open(self.config_path, 'r') as f:
+                    config = yaml.safe_load(f)
                     
-                    if is_only_tool_result and len(msg["content"]) > 0:
-                        logger.debug(f"🛠️ Converting tool_result to text format")
-                        all_text = ""
-                        for block in msg["content"]:
-                            all_text += "Tool Result:\n"
-                            result_content = block.get("content", [])
-                            
-                            if isinstance(result_content, list):
-                                for item in result_content:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        all_text += item.get("text", "") + "\n"
-                                    elif isinstance(item, dict):
-                                        try:
-                                            item_text = item.get("text", json.dumps(item))
-                                            all_text += item_text + "\n"
-                                        except:
-                                            all_text += str(item) + "\n"
-                            elif isinstance(result_content, str):
-                                all_text += result_content + "\n"
-                            else:
-                                try:
-                                    all_text += json.dumps(result_content) + "\n"
-                                except:
-                                    all_text += str(result_content) + "\n"
+                self.mode = config.get('mode', 'priority-based')
+                self.models = config.get('models', {})
+                
+                # Load providers
+                self.providers = []
+                for provider_config in config.get('providers', []):
+                    provider = ProviderConfig(
+                        name=provider_config['name'],
+                        api_key_env_var=provider_config['apiKeyEnvVar'],
+                        base_url=provider_config['baseUrl'],
+                        models=provider_config.get('models', {})
+                    )
+                    
+                    if provider.api_key:
+                        self.providers.append(provider)
+                        logger.info(f"✅ Loaded provider: {provider.name} with {len(provider.models)} models")
+                    else:
+                        logger.warning(f"⚠️ Skipping provider {provider.name}: API key not found in env var {provider.api_key_env_var}")
                         
-                        litellm_request["messages"][i]["content"] = all_text.strip() or "..."
-                        continue
-                
-                if "content" in msg and isinstance(msg["content"], list):
-                    text_content = ""
-                    for block in msg["content"]:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                text_content += block.get("text", "") + "\n"
-                            elif block.get("type") == "tool_result":
-                                tool_id = block.get("tool_use_id", "unknown")
-                                text_content += f"[Tool Result ID: {tool_id}]\n"
-                                
-                                result_content = block.get("content", [])
-                                if isinstance(result_content, list):
-                                    for item in result_content:
-                                        if isinstance(item, dict) and item.get("type") == "text":
-                                            text_content += item.get("text", "") + "\n"
-                                        elif isinstance(item, dict):
-                                            if "text" in item:
-                                                text_content += item.get("text", "") + "\n"
-                                            else:
-                                                try:
-                                                    text_content += json.dumps(item) + "\n"
-                                                except:
-                                                    text_content += str(item) + "\n"
-                                elif isinstance(result_content, str):
-                                    text_content += result_content + "\n"
-                                else:
-                                    try:
-                                        text_content += json.dumps(result_content) + "\n"
-                                    except:
-                                        text_content += str(result_content) + "\n"
-                            elif block.get("type") == "tool_use":
-                                tool_name = block.get("name", "unknown")
-                                tool_id = block.get("id", "unknown")
-                                tool_input = json.dumps(block.get("input", {}))
-                                text_content += f"[Tool: {tool_name} (ID: {tool_id})]\nInput: {tool_input}\n\n"
-                            elif block.get("type") == "image":
-                                text_content += "[Image content - not displayed in text format]\n"
-                    
-                    if not text_content.strip():
-                        text_content = "..."
-                    
-                    litellm_request["messages"][i]["content"] = text_content.strip()
-                elif msg.get("content") is None:
-                    litellm_request["messages"][i]["content"] = "..."
-                
-                # Remove unsupported fields
-                for key in list(msg.keys()):
-                    if key not in ["role", "content", "name", "tool_call_id", "tool_calls"]:
-                        del msg[key]
-            
-            # Final validation
-            for i, msg in enumerate(litellm_request["messages"]):
-                if isinstance(msg.get("content"), list):
-                    logger.warning(f"⚠️ Message {i} still has list content after processing")
-                    litellm_request["messages"][i]["content"] = f"Content as JSON: {json.dumps(msg.get('content'))}"
-                elif msg.get("content") is None:
-                    litellm_request["messages"][i]["content"] = "..."
+                logger.info(f"🔧 Load balancer mode: {self.mode}")
+                logger.info(f"📋 Global model configs: {len(self.models)}")
+                logger.info(f"🌐 Active providers: {len(self.providers)}")
+            else:
+                logger.warning(f"Config file {self.config_path} not found, using defaults")
+                self.create_default_config()
+        except Exception as e:
+            logger.error(f"Error loading config: {e}")
+            self.create_default_config()
+    
+    def create_default_config(self):
+        """Create a default configuration."""
+        logger.info("Creating default configuration...")
+        self.providers = []
         
-        # Log the request
-        num_tools = len(request.tools) if request.tools else 0
-        log_request_beautifully(
-            "POST", 
-            raw_request.url.path, 
-            display_model, 
-            litellm_request.get('model'),
-            len(litellm_request['messages']),
-            num_tools,
-            200
-        )
-        
-        # Handle streaming vs non-streaming
-        if request.stream:
-            logger.debug(f"🌊 Starting streaming response")
-            response_generator = await litellm.acompletion(**litellm_request)
-            
-            return StreamingResponse(
-                handle_streaming(response_generator, request),
-                media_type="text/event-stream"
+        # Check for OpenAI API key
+        if os.environ.get("OPENAI_API_KEY"):
+            openai_provider = ProviderConfig(
+                name="OpenAI",
+                api_key_env_var="OPENAI_API_KEY",
+                base_url="https://api.openai.com/v1",
+                models={
+                    "gpt-4o": "gpt-4o",
+                    "gpt-4o-mini": "gpt-4o-mini",
+                    "gpt-4-turbo": "gpt-4-turbo",
+                    "claude-sonnet-4": "gpt-4o",  # Fallback mapping
+                }
             )
+            self.providers.append(openai_provider)
+            logger.info("✅ Added default OpenAI provider")
+        
+        # Check for Anthropic API key
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            anthropic_provider = ProviderConfig(
+                name="Anthropic",
+                api_key_env_var="ANTHROPIC_API_KEY",
+                base_url="https://api.anthropic.com",
+                models={
+                    "claude-sonnet-4": "claude-3-5-sonnet-20241022",
+                    "claude-haiku": "claude-3-haiku-20240307",
+                    "claude-opus": "claude-3-opus-20240229",
+                }
+            )
+            self.providers.append(anthropic_provider)
+            logger.info("✅ Added default Anthropic provider")
+    
+    def get_providers_for_model(self, model_name: str) -> List[ProviderConfig]:
+        """Get providers that support a given model, in order based on mode."""
+        providers = [p for p in self.providers if p.has_model(model_name)]
+        
+        if self.mode == "round-robin":
+            # For round-robin, we'll rotate the order based on request count
+            if providers:
+                # Simple round-robin based on total requests across all providers
+                total_requests = sum(p.request_count for p in providers)
+                rotation = total_requests % len(providers)
+                providers = providers[rotation:] + providers[:rotation]
+        
+        # For priority-based, keep the order as-is (first in config = highest priority)
+        return providers
+
+# Global config instance
+config = LoadBalancerConfig()
+
+class OpenAIMessage(BaseModel):
+    role: str
+    content: Union[str, List[Dict[str, Any]]]
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+
+class OpenAITool(BaseModel):
+    type: str = "function"
+    function: Dict[str, Any]
+
+class OpenAIChatRequest(BaseModel):
+    model: str
+    messages: List[OpenAIMessage]
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    stop: Optional[Union[str, List[str]]] = None
+    stream: Optional[bool] = False
+    tools: Optional[List[OpenAITool]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+
+def convert_openai_to_anthropic(openai_request: OpenAIChatRequest) -> MessagesRequest:
+    """Convert OpenAI API request to Anthropic format."""
+    messages = []
+    system_message = None
+    
+    # Process messages and extract system message
+    for msg in openai_request.messages:
+        if msg.role == "system":
+            system_message = msg.content if isinstance(msg.content, str) else str(msg.content)
         else:
-            logger.debug(f"💬 Starting non-streaming response")
-            start_time = time.time()
-            litellm_response = litellm.completion(**litellm_request)
-            logger.debug(f"✅ Response received in {time.time() - start_time:.2f}s")
+            # Convert message content
+            if isinstance(msg.content, str):
+                content = msg.content
+            else:
+                # Handle complex content (images, etc.)
+                content = []
+                for item in msg.content:
+                    if item.get("type") == "text":
+                        content.append({"type": "text", "text": item.get("text", "")})
+                    elif item.get("type") == "image_url":
+                        # Convert to Anthropic image format
+                        content.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",  # Default
+                                "data": item.get("image_url", {}).get("url", "").replace("data:image/jpeg;base64,", "")
+                            }
+                        })
             
-            # Convert response using existing function
-            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
-            return anthropic_response
-                
-    except Exception as e:
-        import traceback
-        error_traceback = traceback.format_exc()
-        
-        # Enhanced error details
-        error_details = {
-            "error": str(e),
-            "type": type(e).__name__,
-            "traceback": error_traceback
-        }
-        
-        # Check for LiteLLM-specific attributes
-        for attr in ['message', 'status_code', 'response', 'llm_provider', 'model']:
-            if hasattr(e, attr):
-                error_details[attr] = getattr(e, attr)
-        
-        logger.error(f"💥 Load balancer error: {json.dumps(error_details, indent=2)}")
-        
-        # Format error response
-        error_message = f"Load Balancer Error: {str(e)}"
-        if 'message' in error_details and error_details['message']:
-            error_message += f"\nMessage: {error_details['message']}"
-        if 'response' in error_details and error_details['response']:
-            error_message += f"\nResponse: {error_details['response']}"
-        
-        status_code = error_details.get('status_code', 500)
-        raise HTTPException(status_code=status_code, detail=error_message)
+            # Handle tool calls
+            if msg.tool_calls:
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}] if content else []
+                for tool_call in msg.tool_calls:
+                    content.append({
+                        "type": "tool_use",
+                        "id": tool_call.get("id", str(uuid.uuid4())),
+                        "name": tool_call.get("function", {}).get("name", ""),
+                        "input": json.loads(tool_call.get("function", {}).get("arguments", "{}"))
+                    })
+            
+            # Handle tool call responses
+            if msg.tool_call_id:
+                if isinstance(content, str):
+                    content = [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.tool_call_id,
+                        "content": content
+                    }]
+            
+            messages.append(Message(role=msg.role, content=content))
+    
+    # Convert tools
+    tools = None
+    if openai_request.tools:
+        tools = []
+        for tool in openai_request.tools:
+            tools.append(Tool(
+                name=tool.function["name"],
+                description=tool.function.get("description", ""),
+                input_schema=tool.function.get("parameters", {})
+            ))
+    
+    # Convert tool_choice
+    tool_choice = None
+    if openai_request.tool_choice:
+        if openai_request.tool_choice == "auto":
+            tool_choice = {"type": "auto"}
+        elif openai_request.tool_choice == "none":
+            tool_choice = {"type": "none"}
+        elif isinstance(openai_request.tool_choice, dict):
+            tool_choice = {
+                "type": "tool",
+                "name": openai_request.tool_choice.get("function", {}).get("name", "")
+            }
+    
+    return MessagesRequest(
+        model=openai_request.model,
+        max_tokens=openai_request.max_tokens or 4096,
+        messages=messages,
+        system=system_message,
+        temperature=openai_request.temperature,
+        top_p=openai_request.top_p,
+        tools=tools,
+        tool_choice=tool_choice,
+        stream=openai_request.stream
+    )
 
-@app.post("/v1/messages/count_tokens")
-async def count_tokens_load_balanced(
-    request: TokenCountRequest,
-    raw_request: Request
-):
-    """Load-balanced version of the token counting endpoint."""
-    try:
-        original_model = request.original_model or request.model
-        
-        # Get display name for logging
-        display_model = original_model
-        if "/" in display_model:
-            display_model = display_model.split("/")[-1]
-        
-        logger.debug(f"🔢 LOAD BALANCED TOKEN COUNT: Model={request.model}")
-        
-        # Convert the messages using existing function
-        from openai_anthropic import MessagesRequest
-        converted_request = convert_anthropic_to_litellm(
-            MessagesRequest(
-                model=request.model,
-                max_tokens=100,
-                messages=request.messages,
-                system=request.system,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-                thinking=request.thinking
-            )
-        )
-        
-        # Apply load balancing
-        converted_request = enhance_litellm_request_with_load_balancing(converted_request, request.model)
-        
-        # Log the request
-        num_tools = len(request.tools) if request.tools else 0
-        log_request_beautifully(
-            "POST",
-            raw_request.url.path,
-            display_model,
-            converted_request.get('model'),
-            len(converted_request['messages']),
-            num_tools,
-            200
-        )
-        
-        # Count tokens using LiteLLM
-        try:
-            from litellm import token_counter
-            
-            token_count = token_counter(
-                model=converted_request["model"],
-                messages=converted_request["messages"],
-            )
-            
-            return TokenCountResponse(input_tokens=token_count)
-            
-        except ImportError:
-            logger.error("❌ Could not import token_counter from litellm")
-            return TokenCountResponse(input_tokens=1000)
-            
-    except Exception as e:
-        import traceback
-        error_traceback = traceback.format_exc()
-        logger.error(f"💥 Token count error: {str(e)}\n{error_traceback}")
-        raise HTTPException(status_code=500, detail=f"Error counting tokens: {str(e)}")
-
-@app.get("/")
-async def root():
-    """Root endpoint with load balancer status."""
+def convert_anthropic_to_openai(anthropic_response: MessagesResponse) -> Dict[str, Any]:
+    """Convert Anthropic API response to OpenAI format."""
+    choices = []
+    
+    # Process content blocks
+    content = ""
+    tool_calls = []
+    
+    for block in anthropic_response.content:
+        if block.type == "text":
+            content += block.text
+        elif block.type == "tool_use":
+            tool_calls.append({
+                "id": block.id,
+                "type": "function",
+                "function": {
+                    "name": block.name,
+                    "arguments": json.dumps(block.input)
+                }
+            })
+    
+    # Create message
+    message = {
+        "role": "assistant",
+        "content": content if content or not tool_calls else None
+    }
+    
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    
+    # Map stop reason
+    finish_reason = "stop"
+    if anthropic_response.stop_reason == "max_tokens":
+        finish_reason = "length"
+    elif anthropic_response.stop_reason == "tool_use":
+        finish_reason = "tool_calls"
+    
+    choices.append({
+        "index": 0,
+        "message": message,
+        "finish_reason": finish_reason
+    })
+    
     return {
-        "message": "LM Proxy Load Balancer",
-        "status": "running",
-        "load_balancer": {
-            "openai_keys": len(lb_config.openai_keys),
-            "anthropic_keys": len(lb_config.anthropic_keys),
-            "service_endpoints": lb_config.service_endpoints
+        "id": anthropic_response.id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": anthropic_response.model,
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": anthropic_response.usage.input_tokens,
+            "completion_tokens": anthropic_response.usage.output_tokens,
+            "total_tokens": anthropic_response.usage.input_tokens + anthropic_response.usage.output_tokens
         }
     }
+
+async def make_provider_request(provider: ProviderConfig, request_data: Dict[str, Any], 
+                              is_anthropic_format: bool = True, is_streaming: bool = False) -> Union[Dict[str, Any], AsyncIterable]:
+    """Make a request to a specific provider."""
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    # Determine endpoint and headers based on provider
+    if "anthropic.com" in provider.base_url:
+        endpoint = f"{provider.base_url}/v1/messages"
+        headers["x-api-key"] = provider.api_key
+        headers["anthropic-version"] = "2023-06-01"
+    else:
+        # OpenAI-compatible endpoint
+        endpoint = f"{provider.base_url}/chat/completions"
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    
+    # Apply global model configuration
+    model_name = request_data.get("model", "")
+    if model_name in config.models:
+        model_config = config.models[model_name]
+        for key, value in model_config.items():
+            if key not in request_data or request_data[key] is None:
+                request_data[key] = value
+    
+    # Map model name
+    mapped_model = provider.get_mapped_model(model_name)
+    if mapped_model:
+        request_data["model"] = mapped_model
+    
+    # Convert request format if needed
+    if "anthropic.com" in provider.base_url and not is_anthropic_format:
+        # Need to convert OpenAI format to Anthropic
+        openai_req = OpenAIChatRequest(**request_data)
+        anthropic_req = convert_openai_to_anthropic(openai_req)
+        request_data = anthropic_req.dict(exclude_none=True)
+    elif "anthropic.com" not in provider.base_url and is_anthropic_format:
+        # Need to convert Anthropic format to OpenAI
+        # This is more complex and would require implementing the reverse conversion
+        # For now, we'll assume providers match the request format
+        pass
+    
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            if is_streaming:
+                request_data["stream"] = True
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json=request_data,
+                    timeout=120.0
+                )
+                response.raise_for_status()
+                return response.aiter_lines()
+            else:
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json=request_data,
+                    timeout=120.0
+                )
+                response.raise_for_status()
+                return response.json()
+                
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+            else:
+                raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+async def try_providers(model_name: str, request_data: Dict[str, Any], 
+                       is_anthropic_format: bool = True, is_streaming: bool = False):
+    """Try providers in order until one succeeds."""
+    providers = config.get_providers_for_model(model_name)
+    
+    if not providers:
+        raise HTTPException(status_code=404, detail=f"No providers available for model: {model_name}")
+    
+    last_error = None
+    
+    for i, provider in enumerate(providers):
+        try:
+            logger.info(f"🔄 Trying provider {provider.name} for model {model_name} (attempt {i+1}/{len(providers)})")
+            
+            # Update request count
+            provider.request_count += 1
+            provider.last_request_time = time.time()
+            
+            result = await make_provider_request(provider, request_data.copy(), is_anthropic_format, is_streaming)
+            
+            logger.info(f"✅ Success with provider {provider.name}")
+            return result, provider
+            
+        except HTTPException as e:
+            last_error = e
+            if e.status_code == 429 and i < len(providers) - 1:
+                # Rate limit hit, try next provider
+                logger.warning(f"⚠️ Rate limit hit on {provider.name}, trying next provider...")
+                continue
+            elif i == len(providers) - 1:
+                # Last provider, re-raise the error
+                logger.error(f"❌ All providers failed. Last error: {e.detail}")
+                raise e
+            else:
+                # Other error, try next provider
+                logger.warning(f"⚠️ Error with {provider.name}: {e.detail}, trying next provider...")
+                continue
+        except Exception as e:
+            last_error = e
+            logger.error(f"❌ Unexpected error with {provider.name}: {str(e)}")
+            if i == len(providers) - 1:
+                raise HTTPException(status_code=500, detail=str(e))
+            continue
+    
+    # If we get here, all providers failed
+    raise HTTPException(status_code=500, detail=f"All providers failed. Last error: {str(last_error)}")
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: MessagesRequest, raw_request: Request):
+    """Anthropic-compatible messages endpoint."""
+    try:
+        request_data = request.dict(exclude_none=True)
+        model_name = request.model
+        
+        # Log the request
+        body = await raw_request.body()
+        body_json = json.loads(body.decode('utf-8'))
+        original_model = body_json.get("model", model_name)
+        
+        if request.stream:
+            result, provider = await try_providers(model_name, request_data, is_anthropic_format=True, is_streaming=True)
+            
+            log_request_beautifully(
+                "POST", "/v1/messages", original_model, provider.name,
+                len(request.messages), len(request.tools) if request.tools else 0, 200
+            )
+            
+            async def stream_response():
+                async for line in result:
+                    if line:
+                        yield f"{line}\n"
+            
+            return StreamingResponse(stream_response(), media_type="text/event-stream")
+        else:
+            result, provider = await try_providers(model_name, request_data, is_anthropic_format=True, is_streaming=False)
+            
+            log_request_beautifully(
+                "POST", "/v1/messages", original_model, provider.name,
+                len(request.messages), len(request.tools) if request.tools else 0, 200
+            )
+            
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error in anthropic_messages: {str(e)}")
+        raise e
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: OpenAIChatRequest, raw_request: Request):
+    """OpenAI-compatible chat completions endpoint."""
+    try:
+        model_name = request.model
+        
+        # Convert to common format for provider routing
+        request_data = request.dict(exclude_none=True)
+        
+        if request.stream:
+            result, provider = await try_providers(model_name, request_data, is_anthropic_format=False, is_streaming=True)
+            
+            log_request_beautifully(
+                "POST", "/v1/chat/completions", model_name, provider.name,
+                len(request.messages), len(request.tools) if request.tools else 0, 200
+            )
+            
+            async def stream_response():
+                async for line in result:
+                    if line:
+                        yield f"{line}\n"
+            
+            return StreamingResponse(stream_response(), media_type="text/event-stream")
+        else:
+            result, provider = await try_providers(model_name, request_data, is_anthropic_format=False, is_streaming=False)
+            
+            log_request_beautifully(
+                "POST", "/v1/chat/completions", model_name, provider.name,
+                len(request.messages), len(request.tools) if request.tools else 0, 200
+            )
+            
+            # Convert response if needed
+            if "anthropic.com" in provider.base_url:
+                # Convert Anthropic response to OpenAI format
+                anthropic_response = MessagesResponse(**result)
+                result = convert_anthropic_to_openai(anthropic_response)
+            
+            return result
+            
+    except Exception as e:
+        raise e
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(request: TokenCountRequest):
+    """Token counting endpoint (Anthropic format)."""
+    # Use first available provider for token counting
+    providers = config.get_providers_for_model(request.model)
+    if not providers:
+        raise HTTPException(status_code=404, detail=f"No providers available for model: {request.model}")
+    
+    # For token counting, we'll use a simple estimation
+    # In a real implementation, you'd want to use the provider's token counting API
+    total_chars = 0
+    for message in request.messages:
+        if isinstance(message.content, str):
+            total_chars += len(message.content)
+        elif isinstance(message.content, list):
+            for block in message.content:
+                if hasattr(block, 'text'):
+                    total_chars += len(block.text)
+    
+    # Rough estimation: 1 token ≈ 4 characters
+    estimated_tokens = total_chars // 4
+    
+    return TokenCountResponse(input_tokens=estimated_tokens)
+
+@app.get("/v1/models")
+async def list_models():
+    """List available models across all providers."""
+    models = []
+    for provider in config.providers:
+        for common_name, provider_model in provider.models.items():
+            models.append({
+                "id": common_name,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": provider.name.lower(),
+                "provider": provider.name,
+                "provider_model": provider_model
+            })
+    
+    return {"object": "list", "data": models}
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint with detailed status."""
+    """Health check endpoint."""
     return {
         "status": "healthy",
-        "timestamp": time.time(),
-        "load_balancer": {
-            "openai_keys_configured": len(lb_config.openai_keys),
-            "anthropic_keys_configured": len(lb_config.anthropic_keys),
-            "endpoints": lb_config.service_endpoints
+        "providers": len(config.providers),
+        "mode": config.mode,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information."""
+    return {
+        "name": "Multi-Provider LLM Load Balancer",
+        "version": "1.0.0",
+        "providers": [{"name": p.name, "models": len(p.models)} for p in config.providers],
+        "mode": config.mode,
+        "endpoints": {
+            "anthropic": "/v1/messages",
+            "openai": "/v1/chat/completions",
+            "models": "/v1/models",
+            "health": "/health"
         }
     }
 
-@app.get("/stats")
-async def get_stats():
-    """Get load balancer statistics."""
-    return {
-        "load_balancer_stats": {
-            "openai": {
-                "keys_count": len(lb_config.openai_keys),
-                "endpoints": lb_config.service_endpoints.get("openai", [])
-            },
-            "anthropic": {
-                "keys_count": len(lb_config.anthropic_keys),
-                "endpoints": lb_config.service_endpoints.get("anthropic", [])
-            }
-        }
-    }
+def print_help():
+    print("Multi-Provider LLM Load Balancer")
+    print("Usage: python server.py [--config config.yaml] [--port 8082]")
+    print("\nEnvironment variables:")
+    print("  OPENAI_API_KEY, ANTHROPIC_API_KEY, etc. - API keys for providers")
+    print("\nEndpoints:")
+    print("  POST /v1/messages - Anthropic-compatible endpoint")
+    print("  POST /v1/chat/completions - OpenAI-compatible endpoint")
+    print("  GET /v1/models - List available models")
+    print("  GET /health - Health check")
+
+def print_startup_banner(port):
+    print(f"{Colors.BOLD}{Colors.CYAN}🚀 Multi-Provider LLM Load Balancer{Colors.RESET}")
+    print(f"{Colors.GREEN}📡 Starting server on http://0.0.0.0:{port}{Colors.RESET}")
+    print(f"{Colors.BLUE}🔧 Mode: {config.mode}{Colors.RESET}")
+    print(f"{Colors.MAGENTA}🌐 Active providers: {len(config.providers)}{Colors.RESET}")
+    for provider in config.providers:
+        print(f"  • {Colors.YELLOW}{provider.name}{Colors.RESET}: {len(provider.models)} models")
+    print()
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--help":
-        print("Load Balancing LM Proxy Server")
-        print("===============================")
-        print()
-        print("Environment Variables:")
-        print("  OPENAI_API_KEYS     - Comma-separated list of OpenAI API keys")
-        print("  ANTHROPIC_API_KEYS  - Comma-separated list of Anthropic API keys")
-        print("  SERVICE_ENDPOINTS   - JSON object mapping services to endpoint URLs")
-        print()
-        print("Example:")
-        print('  OPENAI_API_KEYS="key1,key2,key3"')
-        print('  ANTHROPIC_API_KEYS="key1,key2"')
-        print('  SERVICE_ENDPOINTS=\'{"openai": ["https://api.openai.com/v1", "https://api2.openai.com/v1"], "anthropic": ["https://api.anthropic.com/v1"]}\'')
-        print()
-        print("Run with: uvicorn server:app --reload --host 0.0.0.0 --port 8082")
-        sys.exit(0)
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--help":
+            print_help()
+            sys.exit(0)
+        elif sys.argv[1] == "--config" and len(sys.argv) > 2:
+            config = LoadBalancerConfig(sys.argv[2])
     
-    # Configure uvicorn to run with minimal logs
-    uvicorn.run(app, host="0.0.0.0", port=8082, log_level="error")
+    port = 8082
+    if "--port" in sys.argv:
+        port_idx = sys.argv.index("--port")
+        if port_idx + 1 < len(sys.argv):
+            port = int(sys.argv[port_idx + 1])
+    
+    print_startup_banner(port)
+    
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="error")

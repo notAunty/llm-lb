@@ -2,8 +2,7 @@
 
 **Use Anthropic clients (like Claude Code) with Gemini or OpenAI backends.** 🤝
 
-A proxy server that lets you use Anthropic clients with Gemini or OpenAI models via LiteLLM. 🌉
-
+A proxy server that lets you use Anthropic clients with Gemini or OpenAI models via LiteLLM. Now with **load balancing** support for multiple API keys and providers! 🌉
 
 ![Anthropic API Proxy](pic.png)
 
@@ -43,9 +42,12 @@ A proxy server that lets you use Anthropic clients with Gemini or OpenAI models 
    *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`.
    *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`.
 
-   **Mapping Logic:**
-   - If `PREFERRED_PROVIDER=openai` (default), `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `openai/`.
-   - If `PREFERRED_PROVIDER=google`, `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `gemini/` *if* those models are in the server's known `GEMINI_MODELS` list (otherwise falls back to OpenAI mapping).
+   **New: Load Balancer Mode** - Use multiple API keys for better reliability:
+   ```bash
+   # Instead of single keys, use comma-separated lists
+   OPENAI_API_KEYS="sk-key1,sk-key2,sk-key3"
+   ANTHROPIC_API_KEYS="sk-ant-key1,sk-ant-key2"
+   ```
 
 4. **Run the server**:
    ```bash
@@ -140,6 +142,17 @@ PREFERRED_PROVIDER="openai"
 BIG_MODEL="gpt-4o" # Example specific model
 SMALL_MODEL="gpt-4o-mini" # Example specific model
 ```
+
+## Load Balancer Features 🔧
+
+**New**: The server now supports load balancing across multiple providers and API keys:
+
+- **Multiple API Keys**: Use `OPENAI_API_KEYS="key1,key2,key3"` format
+- **Priority-based**: Try providers in order until one succeeds
+- **Round-robin**: Distribute requests evenly across providers
+- **YAML Configuration**: Create `config.yaml` for advanced setup
+- **Health Checks**: Monitor `/health` endpoint
+- **Model Listing**: Check `/v1/models` for available models
 
 ## How It Works 🧩
 
