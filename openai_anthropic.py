@@ -1,3 +1,5 @@
+# Credits to https://github.com/1rgs/claude-code-proxy
+
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 import logging
