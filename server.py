@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import logging
 import json
@@ -13,6 +14,8 @@ import time
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Literal
+import argparse
+import sys
 
 # Import useful functions from openai_anthropic.py
 from openai_anthropic import (
@@ -37,8 +40,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Load Balancer for OpenAI-compatible LLM providers')
+parser.add_argument('-c', '--config', type=str, default='config.yaml',
+                    help='Path to configuration file (default: config.yaml)')
+parser.add_argument('-p', '--port', type=int, default=None,
+                    help='Port to run the server on (default: 8080 or PORT env var)')
+
+args = parser.parse_args()
+
 # Load configuration
-CONFIG_FILE = os.environ.get("LOADBALANCER_CONFIG", "config.yaml")
+CONFIG_FILE = args.config
 
 def load_config():
     """Load configuration from YAML file"""
@@ -79,6 +91,15 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down load balancer")
 
 app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # OpenAI format models
 class OpenAIMessage(BaseModel):
@@ -124,8 +145,8 @@ def apply_model_config(request: Dict[str, Any], model_name: str) -> Dict[str, An
                 request[key] = value
     return request
 
-async def make_openai_request(provider: Dict[str, Any], request: Dict[str, Any], is_streaming: bool = False):
-    """Make a request to an OpenAI-compatible provider"""
+async def make_openai_request_streaming(provider: Dict[str, Any], request: Dict[str, Any]):
+    """Make a streaming request to an OpenAI-compatible provider"""
     # Get API key
     api_key_var = provider['apiKeyEnvVar']
     api_key = os.environ.get(api_key_var)
@@ -149,29 +170,52 @@ async def make_openai_request(provider: Dict[str, Any], request: Dict[str, Any],
     url = f"{provider['baseUrl']}/chat/completions"
     
     async with httpx.AsyncClient(timeout=120.0) as client:
-        if is_streaming:
-            # For streaming, we need to handle the response differently
-            async with client.stream('POST', url, json=request, headers=headers) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    raise httpx.HTTPStatusError(
-                        f"Error from {provider['name']}: {error_text.decode()}",
-                        request=response.request,
-                        response=response
-                    )
-                
-                async for chunk in response.aiter_lines():
-                    if chunk:
-                        yield chunk + "\n"
-        else:
-            response = await client.post(url, json=request, headers=headers)
+        async with client.stream('POST', url, json=request, headers=headers) as response:
             if response.status_code != 200:
+                error_text = await response.aread()
                 raise httpx.HTTPStatusError(
-                    f"Error from {provider['name']}: {response.text}",
+                    f"Error from {provider['name']}: {error_text.decode()}",
                     request=response.request,
                     response=response
                 )
-            return response.json()
+            
+            async for chunk in response.aiter_lines():
+                if chunk:
+                    yield chunk + "\n"
+
+async def make_openai_request(provider: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
+    """Make a non-streaming request to an OpenAI-compatible provider"""
+    # Get API key
+    api_key_var = provider['apiKeyEnvVar']
+    api_key = os.environ.get(api_key_var)
+    if not api_key:
+        raise ValueError(f"API key not found for provider {provider['name']}: {api_key_var}")
+    
+    # Map model name
+    original_model = request['model']
+    if original_model in provider['models']:
+        request['model'] = provider['models'][original_model]
+    else:
+        raise ValueError(f"Model {original_model} not supported by provider {provider['name']}")
+    
+    # Prepare headers
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Make request
+    url = f"{provider['baseUrl']}/chat/completions"
+    
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(url, json=request, headers=headers)
+        if response.status_code != 200:
+            raise httpx.HTTPStatusError(
+                f"Error from {provider['name']}: {response.text}",
+                request=response.request,
+                response=response
+            )
+        return response.json()
 
 async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: bool = False):
     """Try providers based on configured mode"""
@@ -188,13 +232,15 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
             try:
                 logger.info(f"Trying provider {provider['name']} for model {model_name}")
                 if is_streaming:
-                    # For streaming, return the generator directly
-                    async for chunk in make_openai_request(provider, request.copy(), is_streaming=True):
+                    # For streaming, yield chunks directly
+                    async for chunk in make_openai_request_streaming(provider, request.copy()):
                         yield chunk
                     return
                 else:
+                    # For non-streaming, yield the result
                     result = await make_openai_request(provider, request.copy())
-                    return result
+                    yield result
+                    return
             except Exception as e:
                 logger.warning(f"Provider {provider['name']} failed: {str(e)}")
                 if i == len(providers) - 1:
@@ -205,13 +251,15 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
             try:
                 logger.info(f"Trying provider {provider['name']} for model {model_name}")
                 if is_streaming:
-                    # For streaming, return the generator directly
-                    async for chunk in make_openai_request(provider, request.copy(), is_streaming=True):
+                    # For streaming, yield chunks directly
+                    async for chunk in make_openai_request_streaming(provider, request.copy()):
                         yield chunk
                     return
                 else:
+                    # For non-streaming, yield the result
                     result = await make_openai_request(provider, request.copy())
-                    return result
+                    yield result
+                    return
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429 or "rate" in str(e).lower():
                     logger.warning(f"Rate limit hit for provider {provider['name']}, trying next")
@@ -355,10 +403,13 @@ async def anthropic_messages(request: MessagesRequest, raw_request: Request):
             )
         else:
             # Non-streaming request
-            openai_response = await try_providers(request.model, openai_request)
+            result = None
+            async for response in try_providers(request.model, openai_request):
+                result = response
+                break
             
             # Convert back to Anthropic format
-            anthropic_response = convert_openai_to_anthropic(openai_response, request)
+            anthropic_response = convert_openai_to_anthropic(result, request)
             return anthropic_response
             
     except Exception as e:
@@ -430,8 +481,11 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
             )
         else:
             # Non-streaming request
-            response = await try_providers(request.model, openai_request)
-            return response
+            result = None
+            async for response in try_providers(request.model, openai_request):
+                result = response
+                break
+            return result
             
     except Exception as e:
         logger.error(f"Error in OpenAI endpoint: {str(e)}")
@@ -471,4 +525,6 @@ async def health():
     return {"status": "healthy", "mode": config['mode']}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+    port = args.port or int(os.environ.get("PORT", 8080))
+    logger.info(f"Starting server with config: {CONFIG_FILE} on port: {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
