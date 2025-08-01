@@ -245,7 +245,7 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
                 logger.warning(f"Provider {provider['name']} failed: {str(e)}")
                 if i == len(providers) - 1:
                     raise HTTPException(status_code=503, detail="All providers failed")
-    else:
+    elif config['mode'] == 'priority-based':
         # Priority-based mode
         for i, provider in enumerate(providers):
             try:
@@ -262,14 +262,19 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
                     return
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429 or "rate" in str(e).lower():
-                    logger.warning(f"Rate limit hit for provider {provider['name']}, trying next")
-                    if i < len(providers) - 1:
-                        continue
-                raise HTTPException(status_code=503, detail=f"All providers failed: {str(e)}")
+                    logger.warning(f"Rate limit hit for provider {provider['name']}")
+                error_detail = f"HTTP {e.response.status_code}: {e.response.text if hasattr(e.response, 'text') else str(e)}"
+                logger.warning(f"Provider {provider['name']} failed with {error_detail}")
+                if i == len(providers) - 1:
+                    raise HTTPException(status_code=503, detail=f"All providers failed. Last error: {error_detail}")
+                continue
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed with error: {str(e)}")
                 if i == len(providers) - 1:
-                    raise HTTPException(status_code=503, detail="All providers failed")
+                    raise HTTPException(status_code=503, detail=f"All providers failed. Last error: {str(e)}")
+                continue
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {config['mode']}")
 
 def convert_anthropic_to_openai(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert Anthropic format to OpenAI format"""
