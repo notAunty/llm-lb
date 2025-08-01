@@ -1,171 +1,204 @@
-# Anthropic API Proxy for Gemini & OpenAI Models 🔄
+# LLM API Load Balancer
 
-**Use Anthropic clients (like Claude Code) with Gemini or OpenAI backends.** 🤝
+A load balancer that provides both OpenAI and Anthropic compatible REST endpoints while routing requests exclusively to OpenAI-compatible providers. This enables you to use Anthropic's API format while leveraging multiple OpenAI-compatible providers like OpenRouter, Fireworks.AI, Together AI, Nvidia NIM, Groq Cloud, or any other OpenAI-compatible service.
 
-A proxy server that lets you use Anthropic clients with Gemini or OpenAI models via LiteLLM. Now with **load balancing** support for multiple API keys and providers! 🌉
+## Description
 
-![Anthropic API Proxy](pic.png)
+The LLM Load Balancer acts as a transparent proxy that:
 
-## Quick Start ⚡
+- **Accepts both OpenAI and Anthropic API formats** - Use your preferred API format
+- **Routes to OpenAI-compatible providers only** - Leverage the broad ecosystem of OpenAI-compatible services
+- **Intelligent load balancing** - Supports both round-robin and priority-based routing with automatic failover
+- **Streaming support** - Full streaming capability for both OpenAI and Anthropic endpoints
+- **Model mapping** - Configure common model names that map to provider-specific model identifiers
+- **Rate limit handling** - Automatic retry on 429 errors in priority-based mode
+- **Global model configuration** - Set default parameters like temperature, top_p, max_tokens per model
+
+## Quick Start
 
 ### Prerequisites
 
-- OpenAI API key 🔑
-- Google AI Studio (Gemini) API key (if using Google provider) 🔑
-- [uv](https://github.com/astral-sh/uv) installed.
+- Python 3.10 or higher
+- API keys for your chosen providers
 
-### Setup 🛠️
+### Setup
 
-1. **Clone this repository**:
+1. **Clone and navigate to the project:**
    ```bash
-   git clone https://github.com/1rgs/claude-code-openai.git
-   cd claude-code-openai
+   git clone https://github.com/notAunty/llm-lb.git
+   cd llm-lb
    ```
 
-2. **Install uv** (if you haven't already):
+2. **Install dependencies:**
    ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
-   *(`uv` will handle dependencies based on `pyproject.toml` when you run the server)*
-
-3. **Configure Environment Variables**:
-   Copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
-   Edit `.env` and fill in your API keys and model configurations:
-
-   *   `ANTHROPIC_API_KEY`: (Optional) Needed only if proxying *to* Anthropic models.
-   *   `OPENAI_API_KEY`: Your OpenAI API key (Required if using the default OpenAI preference or as fallback).
-   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if PREFERRED_PROVIDER=google).
-   *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default) or `google`. This determines the primary backend for mapping `haiku`/`sonnet`.
-   *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`.
-   *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`.
-
-   **New: Load Balancer Mode** - Use multiple API keys for better reliability:
-   ```bash
-   # Instead of single keys, use comma-separated lists
-   OPENAI_API_KEYS="sk-key1,sk-key2,sk-key3"
-   ANTHROPIC_API_KEYS="sk-ant-key1,sk-ant-key2"
+   curl -fsSL https://astral.sh/uv/install.sh | sh
    ```
 
-4. **Run the server**:
+3. **Create configuration file:**
    ```bash
-   uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
-   ```
-   *(`--reload` is optional, for development)*
-
-### Using with Claude Code 🎮
-
-1. **Install Claude Code** (if you haven't already):
-   ```bash
-   npm install -g @anthropic-ai/claude-code
+   cp config.yaml.example config.yaml
    ```
 
-2. **Connect to your proxy**:
+4. **Set up environment variables:**
    ```bash
-   ANTHROPIC_BASE_URL=http://localhost:8082 claude
+   export OPENROUTER_API_KEY="your_openrouter_key"
+   export NVIDIA_API_KEY="your_nvidia_key"
+   # Add other provider API keys as needed
    ```
 
-3. **That's it!** Your Claude Code client will now use the configured backend models (defaulting to Gemini) through the proxy. 🎯
+5. **Edit `config.yaml`** with your providers and models
 
-## Model Mapping 🗺️
+6. **Run the server:**
+   ```bash
+   uv run server.py # -c config.yaml -p 8080 (optional)
+   ```
+   
 
-The proxy automatically maps Claude models to either OpenAI or Gemini models based on the configured model:
+## Config File Syntax
 
-| Claude Model | Default Mapping | When BIG_MODEL/SMALL_MODEL is a Gemini model |
-|--------------|--------------|---------------------------|
-| haiku | openai/gpt-4o-mini | gemini/[model-name] |
-| sonnet | openai/gpt-4o | gemini/[model-name] |
+The configuration file uses YAML format with the following structure:
 
-### Supported Models
+```yaml
+# Load balancing mode: "round-robin" or "priority-based"
+mode: priority-based
 
-#### OpenAI Models
-The following OpenAI models are supported with automatic `openai/` prefix handling:
-- o3-mini
-- o1
-- o1-mini
-- o1-pro
-- gpt-4.5-preview
-- gpt-4o
-- gpt-4o-audio-preview
-- chatgpt-4o-latest
-- gpt-4o-mini
-- gpt-4o-mini-audio-preview
-- gpt-4.1
-- gpt-4.1-mini
+# Global model configurations
+models:
+  kimi-k2-instruct:
+    temperature: 0.6
+  claude-sonnet-4:
+    top_p: 0.5
+    temperature: 0.7
+    max_tokens: 4096
 
-#### Gemini Models
-The following Gemini models are supported with automatic `gemini/` prefix handling:
-- gemini-2.5-pro-preview-03-25
-- gemini-2.0-flash
+# Provider configurations (in priority order for priority-based mode)
+providers:
+  - name: OpenRouter Free
+    apiKeyEnvVar: OPENROUTER_API_KEY
+    baseUrl: https://openrouter.ai/api/v1
+    models:
+      kimi-k2-instruct: moonshotai/kimi-k2:free
 
-### Model Prefix Handling
-The proxy automatically adds the appropriate prefix to model names:
-- OpenAI models get the `openai/` prefix 
-- Gemini models get the `gemini/` prefix
-- The BIG_MODEL and SMALL_MODEL will get the appropriate prefix based on whether they're in the OpenAI or Gemini model lists
-
-For example:
-- `gpt-4o` becomes `openai/gpt-4o`
-- `gemini-2.5-pro-preview-03-25` becomes `gemini/gemini-2.5-pro-preview-03-25`
-- When BIG_MODEL is set to a Gemini model, Claude Sonnet will map to `gemini/[model-name]`
-
-### Customizing Model Mapping
-
-Control the mapping using environment variables in your `.env` file or directly:
-
-**Example 1: Default (Use OpenAI)**
-No changes needed in `.env` beyond API keys, or ensure:
-```dotenv
-OPENAI_API_KEY="your-openai-key"
-GEMINI_API_KEY="your-google-key" # Needed if PREFERRED_PROVIDER=google
-# PREFERRED_PROVIDER="openai" # Optional, it's the default
-# BIG_MODEL="gpt-4.1" # Optional, it's the default
-# SMALL_MODEL="gpt-4.1-mini" # Optional, it's the default
+  - name: OpenRouter
+    apiKeyEnvVar: OPENROUTER_API_KEY
+    baseUrl: https://openrouter.ai/api/v1
+    models:
+      kimi-k2-instruct: moonshotai/kimi-k2
+      claude-sonnet-4: anthropic/claude-3.5-sonnet
 ```
 
-**Example 2: Prefer Google**
-```dotenv
-GEMINI_API_KEY="your-google-key"
-OPENAI_API_KEY="your-openai-key" # Needed for fallback
-PREFERRED_PROVIDER="google"
-# BIG_MODEL="gemini-2.5-pro-preview-03-25" # Optional, it's the default for Google pref
-# SMALL_MODEL="gemini-2.0-flash" # Optional, it's the default for Google pref
+### Configuration Fields
+
+#### Global Settings
+- `mode`: Load balancing strategy (`round-robin` | `priority-based`)
+- `models`: Global model configurations with default parameters
+
+#### Provider Settings
+- `name`: Human-readable provider name
+- `apiKeyEnvVar`: Environment variable containing the API key
+- `baseUrl`: Provider's base URL (without `/chat/completions`)
+- `models`: Mapping of common model names to provider-specific model identifiers
+
+## Supported Endpoints
+
+### OpenAI Compatible Endpoints
+- `POST /v1/chat/completions` - Chat completions with streaming support
+- `GET /v1/models` - List available models
+
+### Anthropic Compatible Endpoints  
+- `POST /v1/messages` - Messages endpoint with streaming support
+- `POST /v1/messages/count_tokens` - Token counting
+
+### Health & Monitoring
+- `GET /` - Get server status & configurations
+- `GET /health` - Get health status
+
+## How It Works
+
+### Load Balancing Modes
+
+**Round-Robin Mode:**
+- Distributes requests evenly across all available providers
+- Cycles through providers in order for each request
+- Continues to next provider if current one fails
+
+**Priority-Based Mode:**
+- Always tries providers in the order they appear in the configuration
+- Only moves to next provider on failure or rate limiting (HTTP 429)
+- Automatically retries with next provider on rate limit errors
+- Ideal for cost optimization (cheaper providers first)
+
+### Request Flow
+
+1. **Request received** - Client sends OpenAI or Anthropic format request
+2. **Format conversion** - Anthropic requests converted to OpenAI format internally
+3. **Model configuration** - Global model settings applied
+4. **Provider selection** - Load balancer selects provider based on mode
+5. **Model mapping** - Common model name mapped to provider-specific name
+6. **Request forwarding** - Request sent to selected provider
+7. **Response handling** - Response converted back to original format if needed
+8. **Streaming** - Real-time streaming for compatible requests
+
+### Failure Handling
+
+- **Connection errors**: Automatic retry with next available provider
+- **Rate limiting (429)**: Immediate retry with next provider (priority mode)
+- **Invalid responses**: Logged and retried with next provider
+- **All providers failed**: Returns 503 Service Unavailable
+
+## Use Cases
+
+### Multi-Provider Redundancy
+Ensure high availability by configuring multiple providers as fallbacks:
+```yaml
+mode: priority-based
+providers:
+  - name: Primary Provider
+    # ... configuration
+  - name: Backup Provider  
+    # ... configuration
 ```
 
-**Example 3: Use Specific OpenAI Models**
-```dotenv
-OPENAI_API_KEY="your-openai-key"
-GEMINI_API_KEY="your-google-key"
-PREFERRED_PROVIDER="openai"
-BIG_MODEL="gpt-4o" # Example specific model
-SMALL_MODEL="gpt-4o-mini" # Example specific model
+### Cost Optimization
+Use priority-based mode to prefer cheaper providers:
+```yaml
+mode: priority-based
+providers:
+  - name: Cheap Provider
+    # ... lower cost provider first
+  - name: Premium Provider
+    # ... higher cost provider as fallback
 ```
 
-## Load Balancer Features 🔧
+### Anthropic API Compatibility
+Use Anthropic's API format while accessing OpenAI-compatible providers:
+```python
+import httpx
 
-**New**: The server now supports load balancing across multiple providers and API keys:
+response = httpx.post("http://localhost:8080/v1/messages", json={
+    "model": "claude-sonnet-4",
+    "max_tokens": 1024,
+    "messages": [
+        {"role": "user", "content": "Hello!"}
+    ]
+})
+```
 
-- **Multiple API Keys**: Use `OPENAI_API_KEYS="key1,key2,key3"` format
-- **Priority-based**: Try providers in order until one succeeds
-- **Round-robin**: Distribute requests evenly across providers
-- **YAML Configuration**: Create `config.yaml` for advanced setup
-- **Health Checks**: Monitor `/health` endpoint
-- **Model Listing**: Check `/v1/models` for available models
+### Load Distribution  
+Distribute load evenly across multiple API keys/providers:
+```yaml
+mode: round-robin
+providers:
+  - name: Provider A
+  - name: Provider B  
+  - name: Provider C
+```
 
-## How It Works 🧩
-
-This proxy works by:
-
-1. **Receiving requests** in Anthropic's API format 📥
-2. **Translating** the requests to OpenAI format via LiteLLM 🔄
-3. **Sending** the translated request to OpenAI 📤
-4. **Converting** the response back to Anthropic format 🔄
-5. **Returning** the formatted response to the client ✅
-
-The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients. 🌊
-
-## Contributing 🤝
+## Contributions
 
 Contributions are welcome! Please feel free to submit a Pull Request. 🎁
+
+## References
+
+- [Anthropic API Proxy by 1rgs](https://github.com/1rgs/claude-code-proxy) - My inspiration for this project
+- [LiteLLM Documentation](https://docs.litellm.ai/)
