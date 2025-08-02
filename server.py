@@ -181,7 +181,7 @@ async def make_openai_request_streaming(provider: Dict[str, Any], request: Dict[
             
             async for chunk in response.aiter_lines():
                 if chunk:
-                    yield chunk + "\n"
+                    yield chunk if chunk.startswith('data: ') else f"data: {chunk}"
 
 async def make_openai_request(provider: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
     """Make a non-streaming request to an OpenAI-compatible provider"""
@@ -488,6 +488,10 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
             async def stream_wrapper():
                 try:
                     async for chunk in try_providers(request.model, openai_request, is_streaming=True):
+                        if not chunk.startswith('data: '):
+                            chunk = f"data: {chunk}"
+                        if not chunk.endswith('\n\n'):
+                            chunk = chunk.rstrip() + '\n\n'
                         yield chunk
                 except HTTPException as e:
                     yield f"data: {json.dumps({'error': {'message': e.detail, 'type': 'invalid_request_error'}})}\n\n"
