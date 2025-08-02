@@ -45,7 +45,7 @@ parser = argparse.ArgumentParser(description='Load Balancer for OpenAI-compatibl
 parser.add_argument('-c', '--config', type=str, default='config.yaml',
                     help='Path to configuration file (default: config.yaml)')
 parser.add_argument('-p', '--port', type=int, default=None,
-                    help='Port to run the server on (default: 8080 or PORT env var)')
+                    help='Port to run the server on (default: 11434 or PORT env var)')
 
 args = parser.parse_args()
 
@@ -399,15 +399,22 @@ async def anthropic_messages(request: MessagesRequest, raw_request: Request):
         if request.stream:
             # Handle streaming
             async def stream_wrapper():
-                async for chunk in try_providers(request.model, openai_request, is_streaming=True):
-                    yield chunk
+                try:
+                    async for chunk in try_providers(request.model, openai_request, is_streaming=True):
+                        yield chunk
+                except HTTPException as e:
+                    # Handle HTTP exceptions gracefully in streaming
+                    yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error', 'message': e.detail}})}\n\n"
+                except Exception as e:
+                    logger.error(f"Streaming error: {str(e)}")
+                    yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
             
             return StreamingResponse(
                 handle_anthropic_streaming(stream_wrapper(), request),
                 media_type="text/event-stream"
             )
         else:
-            # Non-streaming request
+            # Non-streaming request - let HTTPException bubble up to be handled by FastAPI
             result = None
             async for response in try_providers(request.model, openai_request):
                 result = response
@@ -417,6 +424,8 @@ async def anthropic_messages(request: MessagesRequest, raw_request: Request):
             anthropic_response = convert_openai_to_anthropic(result, request)
             return anthropic_response
             
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in Anthropic endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -477,8 +486,14 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
         if request.stream:
             # Handle streaming
             async def stream_wrapper():
-                async for chunk in try_providers(request.model, openai_request, is_streaming=True):
-                    yield chunk
+                try:
+                    async for chunk in try_providers(request.model, openai_request, is_streaming=True):
+                        yield chunk
+                except HTTPException as e:
+                    yield f"data: {json.dumps({'error': {'message': e.detail, 'type': 'invalid_request_error'}})}\n\n"
+                except Exception as e:
+                    logger.error(f"Streaming error: {str(e)}")
+                    yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'api_error'}})}\n\n"
             
             return StreamingResponse(
                 stream_wrapper(),
@@ -492,6 +507,8 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
                 break
             return result
             
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in OpenAI endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -530,6 +547,6 @@ async def health():
     return {"status": "healthy", "mode": config['mode']}
 
 if __name__ == "__main__":
-    port = args.port or int(os.environ.get("PORT", 8080))
+    port = args.port or int(os.environ.get("PORT", 11434))
     logger.info(f"Starting server with config: {CONFIG_FILE} on port: {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
