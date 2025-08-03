@@ -378,6 +378,12 @@ async def handle_anthropic_streaming(response_generator, original_request: Messa
 async def anthropic_messages(request: MessagesRequest, raw_request: Request):
     """Anthropic-compatible messages endpoint"""
     try:
+        # Check for CLAUDE_CODE_MODEL override and force replacement
+        claude_code_model = os.environ.get("CLAUDE_CODE_MODEL")
+        if claude_code_model:
+            logger.info(f"{request.model} → {claude_code_model} - CLAUDE_CODE_MODEL forced replacement")
+            request.model = claude_code_model
+            
         # Convert to OpenAI format
         openai_request = convert_anthropic_to_openai(request)
         
