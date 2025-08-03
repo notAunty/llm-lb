@@ -194,6 +194,51 @@ providers:
   - name: Provider C
 ```
 
+### Integration with Popular Tools
+
+#### Claude Code
+To use with Claude Code, set the `CLAUDE_CODE_MODEL` environment variable to force model replacement:
+
+```bash
+export CLAUDE_CODE_MODEL=kimi-k2-instruct
+ANTHROPIC_BASE_URL=http://localhost:11434 && claude
+```
+
+#### OpenCode
+Configure OpenCode by creating or editing `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "kimi-k2-instruct": {
+            "name": "kimi-k2-instruct",
+            "tools": true,
+            "reasoning": false,
+            "options": { "num_ctx": 65536 }
+        }
+      }
+    }
+  }
+}
+```
+
+#### VS Code Extensions
+
+##### Roo Code or Cline
+Works right out of the box! Simply configure the extension settings:
+- Set the API endpoint to `http://localhost:11434/v1`
+- Use any model name from your configuration
+
+##### Cursor
+Not supported unless the app is hosted publicly (requires public URL for Cursor's cloud-based processing).
+
 ## Contributions
 
 Contributions are welcome! Please feel free to submit a Pull Request. 🎁
