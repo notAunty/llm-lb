@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from typing import Literal
 import argparse
 import sys
+import uuid
 
 # Import useful functions from openai_anthropic.py
 from openai_anthropic import (
@@ -108,6 +109,7 @@ class OpenAIMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
+    function_call: Optional[Dict[str, Any]] = None  # Add function_call for legacy support
 
 class OpenAIRequest(BaseModel):
     model: str
@@ -126,6 +128,8 @@ class OpenAIRequest(BaseModel):
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     response_format: Optional[Dict[str, Any]] = None
     seed: Optional[int] = None
+    functions: Optional[List[Dict[str, Any]]] = None  # Add legacy functions support
+    function_call: Optional[Union[str, Dict[str, Any]]] = None  # Add legacy function_call support
 
 def get_provider_for_model(model_name: str):
     """Find providers that support the given model"""
@@ -239,6 +243,8 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
                 else:
                     # For non-streaming, yield the result
                     result = await make_openai_request(provider, request.copy())
+                    # Handle legacy function calling
+                    result = await handle_function_calling_response(result)
                     yield result
                     return
             except Exception as e:
@@ -258,6 +264,8 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
                 else:
                     # For non-streaming, yield the result
                     result = await make_openai_request(provider, request.copy())
+                    # Handle legacy function calling
+                    result = await handle_function_calling_response(result)
                     yield result
                     return
             except httpx.HTTPStatusError as e:
@@ -297,10 +305,37 @@ def convert_anthropic_to_openai(anthropic_request: MessagesRequest) -> Dict[str,
         openai_request["top_p"] = anthropic_request.top_p
     if anthropic_request.stop_sequences:
         openai_request["stop"] = anthropic_request.stop_sequences
+    
+    # Handle tools and functions
     if "tools" in litellm_format:
         openai_request["tools"] = litellm_format["tools"]
     if "tool_choice" in litellm_format:
         openai_request["tool_choice"] = litellm_format["tool_choice"]
+    
+    # Handle legacy function calling format
+    if anthropic_request.tools:
+        # Convert Anthropic tools to OpenAI functions format for legacy support
+        functions = []
+        for tool in anthropic_request.tools:
+            function_def = {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.input_schema
+            }
+            functions.append(function_def)
+        openai_request["functions"] = functions
+        
+        # Handle tool_choice -> function_call mapping
+        if anthropic_request.tool_choice:
+            if isinstance(anthropic_request.tool_choice, dict):
+                if anthropic_request.tool_choice.get("type") == "tool":
+                    tool_name = anthropic_request.tool_choice.get("name")
+                    if tool_name:
+                        openai_request["function_call"] = {"name": tool_name}
+            elif anthropic_request.tool_choice == "auto":
+                openai_request["function_call"] = "auto"
+            elif anthropic_request.tool_choice == "any":
+                openai_request["function_call"] = "auto"
     
     return openai_request
 
@@ -308,6 +343,30 @@ def convert_openai_to_anthropic(openai_response: Dict[str, Any], original_reques
     """Convert OpenAI response to Anthropic format"""
     # OpenAI response has a similar structure to LiteLLM, so we can reuse the converter
     return convert_litellm_to_anthropic(openai_response, original_request)
+
+# Add helper function to handle legacy function calling
+async def handle_function_calling_response(openai_response: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle legacy function calling format and convert to new tool format"""
+    if isinstance(openai_response, dict):
+        # Handle legacy function_call format
+        choices = openai_response.get("choices", [])
+        if choices and len(choices) > 0:
+            message = choices[0].get("message", {})
+            if "function_call" in message:
+                function_call = message["function_call"]
+                # Convert function_call to tool_calls format
+                tool_call = {
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": function_call.get("name", ""),
+                        "arguments": function_call.get("arguments", "{}")
+                    }
+                }
+                message["tool_calls"] = [tool_call]
+                del message["function_call"]
+    
+    return openai_response
 
 async def handle_anthropic_streaming(response_generator, original_request: MessagesRequest):
     """Convert OpenAI SSE format to Anthropic SSE format"""
@@ -335,6 +394,8 @@ async def handle_anthropic_streaming(response_generator, original_request: Messa
     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
     
     accumulated_content = ""
+    tool_calls = []
+    current_tool_call = None
     
     async for line in response_generator:
         if line.startswith("data: "):
@@ -352,17 +413,73 @@ async def handle_anthropic_streaming(response_generator, original_request: Messa
                         accumulated_content += delta["content"]
                         yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta['content']}})}\n\n"
                     
+                    # Handle tool calls in streaming
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        for tool_call_delta in delta["tool_calls"]:
+                            if isinstance(tool_call_delta, dict):
+                                index = tool_call_delta.get("index", 0)
+                                
+                                # Initialize tool call if new
+                                if index >= len(tool_calls):
+                                    tool_calls.append({
+                                        "id": tool_call_delta.get("id", ""),
+                                        "type": "function",
+                                        "function": {
+                                            "name": "",
+                                            "arguments": ""
+                                        }
+                                    })
+                                
+                                # Update tool call
+                                current_tool = tool_calls[index]
+                                if "function" in tool_call_delta:
+                                    func_delta = tool_call_delta["function"]
+                                    if "name" in func_delta:
+                                        current_tool["function"]["name"] += func_delta["name"]
+                                    if "arguments" in func_delta:
+                                        current_tool["function"]["arguments"] += func_delta["arguments"]
+                    
+                    # Handle legacy function_call in streaming
+                    if "function_call" in delta and delta["function_call"]:
+                        func_call = delta["function_call"]
+                        if not current_tool_call:
+                            current_tool_call = {
+                                "id": f"call_{uuid.uuid4().hex[:24]}",
+                                "type": "function",
+                                "function": {
+                                    "name": "",
+                                    "arguments": ""
+                                }
+                            }
+                        
+                        if "name" in func_call:
+                            current_tool_call["function"]["name"] += func_call["name"]
+                        if "arguments" in func_call:
+                            current_tool_call["function"]["arguments"] += func_call["arguments"]
+                    
                     # Handle finish
                     if data["choices"][0].get("finish_reason"):
                         finish_reason = data["choices"][0]["finish_reason"]
                         stop_reason = "end_turn"
+                        
                         if finish_reason == "length":
                             stop_reason = "max_tokens"
                         elif finish_reason == "stop":
                             stop_reason = "stop_sequence"
+                        elif finish_reason == "tool_calls":
+                            stop_reason = "tool_use"
+                        elif finish_reason == "function_call":
+                            stop_reason = "tool_use"
                         
                         # Close content block
                         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                        
+                        # Handle tool calls if present
+                        if tool_calls or current_tool_call:
+                            final_tool_calls = tool_calls if tool_calls else ([current_tool_call] if current_tool_call else [])
+                            for i, tool_call in enumerate(final_tool_calls):
+                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': i+1, 'content_block': {'type': 'tool_use', 'id': tool_call['id'], 'name': tool_call['function']['name'], 'input': json.loads(tool_call['function']['arguments'])}})}\n\n"
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i+1})}\n\n"
                         
                         # Send message_delta with stop reason
                         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': len(accumulated_content.split())}})}\n\n"
@@ -474,11 +591,40 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
         # Convert to dict for processing
         openai_request = request.dict(exclude_unset=True)
         
+        # Handle legacy function calling format
+        if "functions" in openai_request and "tools" not in openai_request:
+            # Convert legacy functions to tools format
+            tools = []
+            for func in openai_request["functions"]:
+                tool = {
+                    "type": "function",
+                    "function": func
+                }
+                tools.append(tool)
+            openai_request["tools"] = tools
+            
+            # Handle function_call to tool_choice mapping
+            if "function_call" in openai_request:
+                func_call = openai_request["function_call"]
+                if isinstance(func_call, dict) and "name" in func_call:
+                    openai_request["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": func_call["name"]}
+                    }
+                elif func_call == "auto":
+                    openai_request["tool_choice"] = "auto"
+                elif func_call == "none":
+                    openai_request["tool_choice"] = "none"
+                del openai_request["function_call"]
+            del openai_request["functions"]
+        
         # Apply model config
         openai_request = apply_model_config(openai_request, request.model)
         
         # Log request
         num_tools = len(request.tools) if request.tools else 0
+        if "tools" in openai_request:
+            num_tools = len(openai_request["tools"])
         log_request_beautifully(
             "POST",
             raw_request.url.path,
@@ -498,6 +644,9 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
                             chunk = f"data: {chunk}"
                         if not chunk.endswith('\n\n'):
                             chunk = chunk.rstrip() + '\n\n'
+
+                        print(chunk)
+
                         yield chunk
                 except HTTPException as e:
                     yield f"data: {json.dumps({'error': {'message': e.detail, 'type': 'invalid_request_error'}})}\n\n"
