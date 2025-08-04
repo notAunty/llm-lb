@@ -197,6 +197,9 @@ providers:
 ### Integration with Popular Tools
 
 #### Claude Code
+
+> WORK IN PROGRESS
+
 To use with Claude Code, set the `CLAUDE_CODE_MODEL` environment variable to force model replacement:
 
 ```bash
@@ -221,7 +224,11 @@ Configure OpenCode by creating or editing `~/.config/opencode/opencode.json`:
             "name": "kimi-k2-instruct",
             "tools": true,
             "reasoning": false,
-            "options": { "num_ctx": 65536 }
+            "options": { "num_ctx": 65536 },
+            "limit": {
+              "context": 131000,
+              "output": 16384
+            }
         }
       }
     }
