@@ -12,13 +12,12 @@ from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 import time
 from contextlib import asynccontextmanager
-from pydantic import BaseModel, Field
-from typing import Literal
+from pydantic import BaseModel
 import argparse
 import sys
 import uuid
 
-# Import useful functions from openai_anthropic.py
+# Import translation layer and utils from openai_anthropic.py
 from openai_anthropic import (
     MessagesRequest,
     Message,
@@ -28,8 +27,6 @@ from openai_anthropic import (
     MessagesResponse,
     convert_anthropic_to_litellm,
     convert_litellm_to_anthropic,
-    parse_tool_result_content,
-    clean_gemini_schema,
     Colors,
     log_request_beautifully
 )
@@ -87,6 +84,8 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(f"Starting load balancer in {config['mode']} mode")
     logger.info(f"Loaded {len(config['providers'])} providers")
+    for provider in config['providers']:
+        logger.info(f"  - {provider['name']}: {len(provider['models'])} models")
     yield
     # Shutdown
     logger.info("Shutting down load balancer")
@@ -102,14 +101,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenAI format models
+# OpenAI format models for direct OpenAI endpoint
 class OpenAIMessage(BaseModel):
     role: str
     content: Union[str, List[Dict[str, Any]], None]
     name: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
-    function_call: Optional[Dict[str, Any]] = None  # Add function_call for legacy support
 
 class OpenAIRequest(BaseModel):
     model: str
@@ -128,8 +126,6 @@ class OpenAIRequest(BaseModel):
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     response_format: Optional[Dict[str, Any]] = None
     seed: Optional[int] = None
-    functions: Optional[List[Dict[str, Any]]] = None  # Add legacy functions support
-    function_call: Optional[Union[str, Dict[str, Any]]] = None  # Add legacy function_call support
 
 def get_provider_for_model(model_name: str):
     """Find providers that support the given model"""
@@ -185,7 +181,7 @@ async def make_openai_request_streaming(provider: Dict[str, Any], request: Dict[
             
             async for chunk in response.aiter_lines():
                 if chunk:
-                    yield chunk if chunk.startswith('data: ') else f"data: {chunk}"
+                    yield chunk
 
 async def make_openai_request(provider: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
     """Make a non-streaming request to an OpenAI-compatible provider"""
@@ -236,15 +232,11 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
             try:
                 logger.info(f"Trying provider {provider['name']} for model {model_name}")
                 if is_streaming:
-                    # For streaming, yield chunks directly
                     async for chunk in make_openai_request_streaming(provider, request.copy()):
                         yield chunk
                     return
                 else:
-                    # For non-streaming, yield the result
                     result = await make_openai_request(provider, request.copy())
-                    # Handle legacy function calling
-                    result = await handle_function_calling_response(result)
                     yield result
                     return
             except Exception as e:
@@ -252,20 +244,16 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
                 if i == len(providers) - 1:
                     raise HTTPException(status_code=503, detail="All providers failed")
     elif config['mode'] == 'priority-based':
-        # Priority-based mode
+        # Priority-based mode (try in order)
         for i, provider in enumerate(providers):
             try:
                 logger.info(f"Trying provider {provider['name']} for model {model_name}")
                 if is_streaming:
-                    # For streaming, yield chunks directly
                     async for chunk in make_openai_request_streaming(provider, request.copy()):
                         yield chunk
                     return
                 else:
-                    # For non-streaming, yield the result
                     result = await make_openai_request(provider, request.copy())
-                    # Handle legacy function calling
-                    result = await handle_function_calling_response(result)
                     yield result
                     return
             except httpx.HTTPStatusError as e:
@@ -284,94 +272,11 @@ async def try_providers(model_name: str, request: Dict[str, Any], is_streaming: 
     else:
         raise HTTPException(status_code=400, detail=f"Invalid mode: {config['mode']}")
 
-def convert_anthropic_to_openai(anthropic_request: MessagesRequest) -> Dict[str, Any]:
-    """Convert Anthropic format to OpenAI format"""
-    # First use the existing converter to get LiteLLM format
-    litellm_format = convert_anthropic_to_litellm(anthropic_request)
-    
-    # Then adapt for direct OpenAI API format
-    openai_request = {
-        "model": anthropic_request.model,
-        "messages": litellm_format["messages"],
-        "stream": anthropic_request.stream,
-    }
-    
-    # Add optional parameters
-    if anthropic_request.max_tokens:
-        openai_request["max_tokens"] = anthropic_request.max_tokens
-    if anthropic_request.temperature is not None:
-        openai_request["temperature"] = anthropic_request.temperature
-    if anthropic_request.top_p is not None:
-        openai_request["top_p"] = anthropic_request.top_p
-    if anthropic_request.stop_sequences:
-        openai_request["stop"] = anthropic_request.stop_sequences
-    
-    # Handle tools and functions
-    if "tools" in litellm_format:
-        openai_request["tools"] = litellm_format["tools"]
-    if "tool_choice" in litellm_format:
-        openai_request["tool_choice"] = litellm_format["tool_choice"]
-    
-    # Handle legacy function calling format
-    if anthropic_request.tools:
-        # Convert Anthropic tools to OpenAI functions format for legacy support
-        functions = []
-        for tool in anthropic_request.tools:
-            function_def = {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.input_schema
-            }
-            functions.append(function_def)
-        openai_request["functions"] = functions
-        
-        # Handle tool_choice -> function_call mapping
-        if anthropic_request.tool_choice:
-            if isinstance(anthropic_request.tool_choice, dict):
-                if anthropic_request.tool_choice.get("type") == "tool":
-                    tool_name = anthropic_request.tool_choice.get("name")
-                    if tool_name:
-                        openai_request["function_call"] = {"name": tool_name}
-            elif anthropic_request.tool_choice == "auto":
-                openai_request["function_call"] = "auto"
-            elif anthropic_request.tool_choice == "any":
-                openai_request["function_call"] = "auto"
-    
-    return openai_request
-
-def convert_openai_to_anthropic(openai_response: Dict[str, Any], original_request: MessagesRequest) -> MessagesResponse:
-    """Convert OpenAI response to Anthropic format"""
-    # OpenAI response has a similar structure to LiteLLM, so we can reuse the converter
-    return convert_litellm_to_anthropic(openai_response, original_request)
-
-# Add helper function to handle legacy function calling
-async def handle_function_calling_response(openai_response: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle legacy function calling format and convert to new tool format"""
-    if isinstance(openai_response, dict):
-        # Handle legacy function_call format
-        choices = openai_response.get("choices", [])
-        if choices and len(choices) > 0:
-            message = choices[0].get("message", {})
-            if "function_call" in message:
-                function_call = message["function_call"]
-                # Convert function_call to tool_calls format
-                tool_call = {
-                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                    "type": "function",
-                    "function": {
-                        "name": function_call.get("name", ""),
-                        "arguments": function_call.get("arguments", "{}")
-                    }
-                }
-                message["tool_calls"] = [tool_call]
-                del message["function_call"]
-    
-    return openai_response
-
 async def handle_anthropic_streaming(response_generator, original_request: MessagesRequest):
-    """Convert OpenAI SSE format to Anthropic SSE format"""
-    # Send initial message_start
+    """Convert OpenAI streaming response to Anthropic streaming format"""
     message_id = f"msg_{int(time.time() * 1000)}"
+    
+    # Send message_start
     message_start = {
         "type": "message_start",
         "message": {
@@ -390,124 +295,123 @@ async def handle_anthropic_streaming(response_generator, original_request: Messa
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
     
-    # Start content block
+    # Start text content block
     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
     
     accumulated_content = ""
     tool_calls = []
-    current_tool_call = None
+    output_tokens = 0
     
-    async for line in response_generator:
-        if line.startswith("data: "):
-            data_str = line[6:]
-            if data_str == "[DONE]":
-                break
-            
-            try:
-                data = json.loads(data_str)
-                if "choices" in data and len(data["choices"]) > 0:
-                    delta = data["choices"][0].get("delta", {})
-                    
-                    # Handle content delta
-                    if "content" in delta and delta["content"]:
-                        accumulated_content += delta["content"]
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta['content']}})}\n\n"
-                    
-                    # Handle tool calls in streaming
-                    if "tool_calls" in delta and delta["tool_calls"]:
-                        for tool_call_delta in delta["tool_calls"]:
-                            if isinstance(tool_call_delta, dict):
+    try:
+        async for line in response_generator:
+            if not line.strip():
+                continue
+                
+            # Parse SSE format
+            if line.startswith("data: "):
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                
+                try:
+                    data = json.loads(data_str)
+                    if "choices" in data and len(data["choices"]) > 0:
+                        choice = data["choices"][0]
+                        delta = choice.get("delta", {})
+                        
+                        # Handle text content
+                        if "content" in delta and delta["content"]:
+                            accumulated_content += delta["content"]
+                            output_tokens += len(delta["content"].split())
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta['content']}})}\n\n"
+                        
+                        # Handle tool calls
+                        if "tool_calls" in delta and delta["tool_calls"]:
+                            for tool_call_delta in delta["tool_calls"]:
                                 index = tool_call_delta.get("index", 0)
                                 
-                                # Initialize tool call if new
-                                if index >= len(tool_calls):
+                                # Ensure we have enough tool call slots
+                                while len(tool_calls) <= index:
                                     tool_calls.append({
-                                        "id": tool_call_delta.get("id", ""),
-                                        "type": "function",
-                                        "function": {
-                                            "name": "",
-                                            "arguments": ""
-                                        }
+                                        "id": "",
+                                        "name": "",
+                                        "arguments": ""
                                     })
                                 
-                                # Update tool call
-                                current_tool = tool_calls[index]
+                                # Update the tool call
+                                if "id" in tool_call_delta:
+                                    tool_calls[index]["id"] = tool_call_delta["id"]
+                                
                                 if "function" in tool_call_delta:
-                                    func_delta = tool_call_delta["function"]
-                                    if "name" in func_delta:
-                                        current_tool["function"]["name"] += func_delta["name"]
-                                    if "arguments" in func_delta:
-                                        current_tool["function"]["arguments"] += func_delta["arguments"]
+                                    func = tool_call_delta["function"]
+                                    if "name" in func:
+                                        tool_calls[index]["name"] += func["name"]
+                                    if "arguments" in func:
+                                        tool_calls[index]["arguments"] += func["arguments"]
+                        
+                        # Handle finish reason
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                            
+                            # Close text content block
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                            
+                            # Handle tool calls if present
+                            if tool_calls:
+                                for i, tool_call in enumerate(tool_calls):
+                                    if tool_call["name"]:  # Only emit if we have a name
+                                        try:
+                                            tool_input = json.loads(tool_call["arguments"]) if tool_call["arguments"] else {}
+                                        except json.JSONDecodeError:
+                                            tool_input = {"raw": tool_call["arguments"]}
+                                        
+                                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': i+1, 'content_block': {'type': 'tool_use', 'id': tool_call['id'], 'name': tool_call['name'], 'input': tool_input}})}\n\n"
+                                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i+1})}\n\n"
+                            
+                            # Map finish reason to Anthropic format
+                            stop_reason = "end_turn"
+                            if finish_reason == "length":
+                                stop_reason = "max_tokens"
+                            elif finish_reason == "tool_calls":
+                                stop_reason = "tool_use"
+                            
+                            # Send message_delta with stop reason
+                            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+                            
+                            # Send message_stop
+                            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+                            return
+                            
+                except json.JSONDecodeError:
+                    continue
                     
-                    # Handle legacy function_call in streaming
-                    if "function_call" in delta and delta["function_call"]:
-                        func_call = delta["function_call"]
-                        if not current_tool_call:
-                            current_tool_call = {
-                                "id": f"call_{uuid.uuid4().hex[:24]}",
-                                "type": "function",
-                                "function": {
-                                    "name": "",
-                                    "arguments": ""
-                                }
-                            }
-                        
-                        if "name" in func_call:
-                            current_tool_call["function"]["name"] += func_call["name"]
-                        if "arguments" in func_call:
-                            current_tool_call["function"]["arguments"] += func_call["arguments"]
-                    
-                    # Handle finish
-                    if data["choices"][0].get("finish_reason"):
-                        finish_reason = data["choices"][0]["finish_reason"]
-                        stop_reason = "end_turn"
-                        
-                        if finish_reason == "length":
-                            stop_reason = "max_tokens"
-                        elif finish_reason == "stop":
-                            stop_reason = "stop_sequence"
-                        elif finish_reason == "tool_calls":
-                            stop_reason = "tool_use"
-                        elif finish_reason == "function_call":
-                            stop_reason = "tool_use"
-                        
-                        # Close content block
-                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                        
-                        # Handle tool calls if present
-                        if tool_calls or current_tool_call:
-                            final_tool_calls = tool_calls if tool_calls else ([current_tool_call] if current_tool_call else [])
-                            for i, tool_call in enumerate(final_tool_calls):
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': i+1, 'content_block': {'type': 'tool_use', 'id': tool_call['id'], 'name': tool_call['function']['name'], 'input': json.loads(tool_call['function']['arguments'])}})}\n\n"
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i+1})}\n\n"
-                        
-                        # Send message_delta with stop reason
-                        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': len(accumulated_content.split())}})}\n\n"
-                        
-                        # Send message_stop
-                        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-                        
-            except json.JSONDecodeError:
-                continue
+    except Exception as e:
+        logger.error(f"Error in streaming: {str(e)}")
+        # Send error and close gracefully
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error'}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 # Anthropic endpoints
 @app.post("/v1/messages")
 async def anthropic_messages(request: MessagesRequest, raw_request: Request):
-    """Anthropic-compatible messages endpoint"""
+    """Anthropic-compatible messages endpoint using translation layer"""
     try:
-        # Check for CLAUDE_CODE_MODEL override and force replacement
+        # Check for CLAUDE_CODE_MODEL override
         claude_code_model = os.environ.get("CLAUDE_CODE_MODEL")
         if claude_code_model:
-            logger.info(f"{request.model} → {claude_code_model} - CLAUDE_CODE_MODEL forced replacement")
+            logger.info(f"{Colors.CYAN}{request.model}{Colors.RESET} → {Colors.GREEN}{claude_code_model}{Colors.RESET} - CLAUDE_CODE_MODEL override")
             request.model = claude_code_model
-            
-        # Convert to OpenAI format
-        openai_request = convert_anthropic_to_openai(request)
         
-        # Apply model config
+        # Use the translation layer to convert to LiteLLM/OpenAI format
+        openai_request = convert_anthropic_to_litellm(request)
+        
+        # Remove the litellm-specific API key field if present
+        openai_request.pop("api_key", None)
+        
+        # Apply model-specific config
         openai_request = apply_model_config(openai_request, request.model)
         
-        # Log request
+        # Log the request
         num_tools = len(request.tools) if request.tools else 0
         log_request_beautifully(
             "POST",
@@ -526,7 +430,6 @@ async def anthropic_messages(request: MessagesRequest, raw_request: Request):
                     async for chunk in try_providers(request.model, openai_request, is_streaming=True):
                         yield chunk
                 except HTTPException as e:
-                    # Handle HTTP exceptions gracefully in streaming
                     yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error', 'message': e.detail}})}\n\n"
                 except Exception as e:
                     logger.error(f"Streaming error: {str(e)}")
@@ -537,14 +440,14 @@ async def anthropic_messages(request: MessagesRequest, raw_request: Request):
                 media_type="text/event-stream"
             )
         else:
-            # Non-streaming request - let HTTPException bubble up to be handled by FastAPI
+            # Non-streaming request
             result = None
             async for response in try_providers(request.model, openai_request):
                 result = response
                 break
             
-            # Convert back to Anthropic format
-            anthropic_response = convert_openai_to_anthropic(result, request)
+            # Convert back to Anthropic format using the translation layer
+            anthropic_response = convert_litellm_to_anthropic(result, request)
             return anthropic_response
             
     except HTTPException:
@@ -553,11 +456,11 @@ async def anthropic_messages(request: MessagesRequest, raw_request: Request):
         logger.error(f"Error in Anthropic endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Anthropic token counting endpoint
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(request: TokenCountRequest):
     """Anthropic-compatible token counting endpoint"""
-    # For simplicity, return a rough estimate
-    # In production, you'd want to use proper tokenization
+    # Simple token estimation based on character count
     total_chars = 0
     
     # Count system message
@@ -591,40 +494,11 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
         # Convert to dict for processing
         openai_request = request.dict(exclude_unset=True)
         
-        # Handle legacy function calling format
-        if "functions" in openai_request and "tools" not in openai_request:
-            # Convert legacy functions to tools format
-            tools = []
-            for func in openai_request["functions"]:
-                tool = {
-                    "type": "function",
-                    "function": func
-                }
-                tools.append(tool)
-            openai_request["tools"] = tools
-            
-            # Handle function_call to tool_choice mapping
-            if "function_call" in openai_request:
-                func_call = openai_request["function_call"]
-                if isinstance(func_call, dict) and "name" in func_call:
-                    openai_request["tool_choice"] = {
-                        "type": "function",
-                        "function": {"name": func_call["name"]}
-                    }
-                elif func_call == "auto":
-                    openai_request["tool_choice"] = "auto"
-                elif func_call == "none":
-                    openai_request["tool_choice"] = "none"
-                del openai_request["function_call"]
-            del openai_request["functions"]
-        
-        # Apply model config
+        # Apply model-specific config
         openai_request = apply_model_config(openai_request, request.model)
         
-        # Log request
+        # Log the request
         num_tools = len(request.tools) if request.tools else 0
-        if "tools" in openai_request:
-            num_tools = len(openai_request["tools"])
         log_request_beautifully(
             "POST",
             raw_request.url.path,
@@ -640,13 +514,11 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
             async def stream_wrapper():
                 try:
                     async for chunk in try_providers(request.model, openai_request, is_streaming=True):
+                        # Ensure proper SSE format
                         if not chunk.startswith('data: '):
                             chunk = f"data: {chunk}"
                         if not chunk.endswith('\n\n'):
                             chunk = chunk.rstrip() + '\n\n'
-
-                        print(chunk)
-
                         yield chunk
                 except HTTPException as e:
                     yield f"data: {json.dumps({'error': {'message': e.detail, 'type': 'invalid_request_error'}})}\n\n"
@@ -659,7 +531,7 @@ async def openai_chat_completions(request: OpenAIRequest, raw_request: Request):
                 media_type="text/event-stream"
             )
         else:
-            # Non-streaming request
+            # Non-streaming request - return OpenAI format directly
             result = None
             async for response in try_providers(request.model, openai_request):
                 result = response
